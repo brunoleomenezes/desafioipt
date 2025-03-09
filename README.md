@@ -1,48 +1,52 @@
-## Visão Geral do Fluxo
+## Visão Geral da Arquitetura
 
-1. **Classifier** (Classificador)  
-   Recebe o texto do usuário e determina se a questão é sobre:
-   - **(0) Pergunta básica** (ex.: saudações, algo trivial que não necessita consultas).  
-   - **(1) Pergunta sobre o guia/FAQ** (texto extenso e pré-cadastrado).  
-   - **(2) Pergunta que requer acesso ao “sistema”** (simulação de chamadas de API para consultar ou alterar dados).  
+1. **Classifier (C)**  
+   Classifica a pergunta do usuário em três categorias:  
+   - **0**: Pergunta trivial ou saudação.  
+   - **1**: Pergunta que requer consulta a um FAQ (documentação interna, guias etc.).  
+   - **2**: Pergunta que requer uma operação no sistema (por exemplo, alterar dados de um usuário).  
 
-2. **Executor**  
-   Baseado na classificação, executa:  
-   - Resposta “simples” se for trivial (categoria 0).  
-   - *Retrieval* (busca) de trechos do guia/FAQ se for categoria 1.  
-   - Chamadas de “API” (funções Python simuladas) se for categoria 2.  
+2. **Executor (E)**  
+   Dependendo da categoria, executa:  
+   - **0 (Trivial)**: Retorna uma saudação ou mensagem simples.  
+   - **1 (FAQ)**: Aplica *Retrieval* no FAQ para encontrar trechos relevantes e, então, usa o LLM (Flan-T5) para gerar uma resposta final.  
+   - **2 (Sistema)**: Identifica a operação e a executa, por exemplo “consultar usuário” ou “alterar disciplina” em uma base de dados simulada.
 
-3. **Verifier**  
-   Verifica a resposta ou operação gerada pelo Executor. Se considerar inválida, retorna o motivo, e uma nova tentativa pode ser feita. Caso seja válida, devolve a resposta final ao usuário.
+3. **Verifier (V)**  
+   Verifica se a operação realizada é válida (por exemplo, checar permissões de usuário). Se não for, devolve um erro e impede a operação.
 
-Esse fluxo reflete o design de muitos sistemas de atendimento que precisam, ao mesmo tempo, **responder perguntas** e **executar operações seguras** no back-end.
+4. **chatbot_pipeline**  
+   Faz o fluxo completo:  
+   - Classifica a pergunta (Classifier).  
+   - Gera resposta ou operação (Executor).  
+   - Valida (Verifier).  
+   - Retorna a resposta final ao usuário (ou mensagem de erro, se inválido).
 
 ---
 
-## Passo a Passo do Código
+## Estrutura de Arquivo
 
-### Passo 0: Instalações e Imports (Google Colab)
+No Google Colab (ou outro ambiente Python), o código pode ser organizado em **blocos** ou **células**. Segue o passo a passo.
 
-```bash
-!pip install sentence-transformers --quiet
-!pip install faiss-cpu --quiet
-```
-
-- **sentence-transformers**: biblioteca para gerar *embeddings* de texto (e.g. *bert-like*).  
-- **faiss-cpu**: biblioteca da Meta (Facebook AI) para fazer busca vetorial (similaridades).
-
-Na sessão Python, importamos:
+### Passo 0: Instalações e Imports
 
 ```python
-from sentence_transformers import SentenceTransformer
+!pip install sentence-transformers faiss-cpu transformers accelerate --quiet
+
+import re
 import faiss
 import numpy as np
-import re
+
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
 ```
 
----
+- **sentence-transformers**: para gerar embeddings do FAQ.  
+- **faiss-cpu**: para busca vetorial local.  
+- **transformers**: para carregar modelos como Flan-T5.  
+- **accelerate**: pode ser necessário para otimizar o uso de CPU/GPU ao carregar modelos Hugging Face.
 
-### Passo 1: Definição do “Corpus” (FAQ) e da “Base de Dados” Simulada
+### Passo 1: Dados e FAQ
 
 ```python
 FAQ_TEXTS = [
@@ -58,32 +62,22 @@ USER_DB = {
 }
 ```
 
-- **FAQ_TEXTS** simula um conjunto de trechos de um guia ou FAQ.
-- **USER_DB** simula uma base de dados de usuários (mini-“sistema”), contendo alguns campos como `disciplina`, `adm` (se é administrador ou não) etc.
+- `FAQ_TEXTS`: lista de strings simulando um FAQ ou documento oficial.  
+- `USER_DB`: dicionário simulando um banco de dados de usuários, com permissões (admin ou não).
 
----
-
-### Passo 2: Indexação do Corpus de FAQ (para busca semântica)
-
-1. **Carregar modelo de embeddings**  
-   Neste caso, usamos `paraphrase-multilingual-MiniLM-L12-v2` (multilíngue e leve).  
-
-2. **Gerar embeddings do FAQ**  
-   Convertendo cada texto do FAQ em um vetor numérico.
-
-3. **Criar índice FAISS**  
-   - Adicionamos as representações vetoriais de cada trecho de FAQ a um índice FAISS, que permite buscas por similaridade.
+### Passo 2: Indexação do FAQ com FAISS
 
 ```python
-model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+embedding_model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+faq_embeddings = embedding_model.encode(FAQ_TEXTS)
 
-faq_embeddings = model.encode(FAQ_TEXTS)
 dimension = faq_embeddings.shape[1]
 index = faiss.IndexFlatL2(dimension)
 index.add(faq_embeddings)
 
 def retrieve_faq_responses(query, top_k=1):
-    query_emb = model.encode([query])
+    """Retorna o(s) trecho(s) de FAQ mais semelhante(s) à query usando busca vetorial."""
+    query_emb = embedding_model.encode([query])
     distances, indices = index.search(query_emb, top_k)
     results = []
     for i in range(top_k):
@@ -92,244 +86,258 @@ def retrieve_faq_responses(query, top_k=1):
     return results
 ```
 
-- **retrieve_faq_responses(query, top_k)** retorna o(s) trecho(s) do FAQ mais próximos semântica ou contextualmente da pergunta.
+- **embedding_model** usa *paraphrase-multilingual-MiniLM-L12-v2* para gerar vetores do FAQ.  
+- **faiss.IndexFlatL2**: cria um índice de busca para similaridade coseno ou euclidiana.  
+- **retrieve_faq_responses**: dado o texto do usuário, retorna até `top_k` trechos mais relevantes.
 
----
+### Passo 3: Carregar Modelo LLM (Flan-T5-base)
 
-### Passo 3: Funções Simuladas de “API do Sistema”
+```python
+model_name = "google/flan-t5-base"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+llm_model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+
+llm_pipeline = pipeline("text2text-generation", model=llm_model, tokenizer=tokenizer)
+
+def call_llm(prompt, max_new_tokens=64):
+    """Chama FLAN-T5-base e retorna o texto gerado."""
+    resp = llm_pipeline(prompt, max_new_tokens=max_new_tokens, do_sample=False)
+    return resp[0]["generated_text"].strip()
+```
+
+- **call_llm**: função auxiliar para enviar um prompt ao pipeline de *text2text-generation* e retornar o texto.
+
+### Passo 4: APIs Simuladas do Sistema
 
 ```python
 def consultar_usuario(username):
-    username = username.lower()
-    return USER_DB.get(username, None)
+    """Retorna dicionário com dados do usuário ou None."""
+    return USER_DB.get(username.lower(), None)
 
 def alterar_disciplina(username, nova_disciplina):
-    username = username.lower()
-    if username in USER_DB:
-        USER_DB[username]["disciplina"] = nova_disciplina
+    """Altera a disciplina do usuário 'username' para 'nova_disciplina'."""
+    user = USER_DB.get(username.lower())
+    if user:
+        user["disciplina"] = nova_disciplina
         return True
     return False
 
 def is_admin(username):
+    """Verifica se user é admin ou não."""
     user = USER_DB.get(username.lower())
     if user:
         return user["adm"]
     return False
 ```
 
-Essas funções exemplificam chamadas comuns em sistemas:
-- `consultar_usuario`: busca os dados no dicionário `USER_DB`.  
-- `alterar_disciplina`: modifica um atributo do usuário.  
-- `is_admin`: verifica se certo usuário é administrador.
+- Em um cenário real, essas funções chamariam APIs REST ou consultas a um banco de dados.
 
----
-
-### Passo 4: Classificador (Classifier)
+### Passo 5: Classificador (Classifier) com LLM
 
 ```python
-def classify_user_text(user_text):
-    text_lower = user_text.lower()
-    
-    # Categoria 0: perguntas básicas
-    if any(x in text_lower for x in ["oi", "olá", "bom dia", "boa tarde"]):
-        return 0
-    
-    # Categoria 1: perguntas de FAQ (heurística)
-    if re.search(r"(como)|(quanto)|(para que)|(custa)|(test)|(guia)", text_lower):
-        return 1
-    
-    # Categoria 2: perguntas que envolvem API (disciplina, usuário, etc.)
-    if re.search(r"(disciplina)|(mudar)|(usuário)|(user)|(alterar)|(admin)|(estudante)", text_lower):
-        return 2
-    
-    # Padrão: consideramos categoria 0
-    return 0
+def classify_user_text_llm(user_text):
+    """
+    Usa o LLM para classificar em:
+    0 - Pergunta trivial
+    1 - Pergunta de FAQ
+    2 - Operação no sistema
+    """
+    prompt = f"""
+Classifique a solicitação abaixo em um número [0,1,2]:
+- 0 se é algo trivial (saudação, etc)
+- 1 se requer resposta do FAQ
+- 2 se requer uma operação de consulta/alteração no sistema
+
+Pergunta: {user_text}
+
+Responda apenas o número.
+"""
+    result = call_llm(prompt, max_new_tokens=10)
+    nums = re.findall(r"[012]", result)
+    if nums:
+        return int(nums[0])
+    return 0  # fallback
 ```
 
-- **Objetivo**: Retornar um número (0, 1 ou 2) indicando se a pergunta do usuário se resolve com resposta básica, consulta ao FAQ ou chamadas de API.  
-- É um exemplo didático com regex/palavras-chave. Em produção, pode-se usar LLMs ou modelos de classificação treinados.
+- **Prompt** pede que o LLM retorne apenas um dígito (0, 1 ou 2).  
+- Usamos regex para isolar o primeiro dígito presente na resposta.
 
----
-
-### Passo 5: Executor (Executor)
+### Passo 6: Executor (Executor)
 
 ```python
 def executor(user_text, classification):
-    operacao_sistema = None  
+    """
+    Retorna (resposta, operacao_sistema).
+    - Se class = 0 => msg trivial
+    - Se class = 1 => RAG no FAQ + LLM
+    - Se class = 2 => chama APIs para consulta/alterar
+    """
+    operacao_sistema = None
     resposta = ""
-    
+
     if classification == 0:
-        # Resposta básica
-        resposta = "Olá! Como posso ajudar?"
-    
+        resposta = "Olá, como posso te ajudar?"
+        return resposta, operacao_sistema
+
     elif classification == 1:
-        # Buscar no FAQ
-        trechos = retrieve_faq_responses(user_text, top_k=1)
-        resposta = f"Baseado no guia, encontrei: {trechos[0]}"
-    
-    elif classification == 2:
-        # Decidir se é "consultar usuário" ou "alterar disciplina" (heurística regex)
+        # RAG + LLM
+        trechos = retrieve_faq_responses(user_text, top_k=2)
+        context_faq = "\n".join(trechos)
+        prompt = f"""
+Você é um assistente em português. Alguém perguntou: "{user_text}"
+Aqui estão trechos do FAQ potencialmente relevantes:
+{context_faq}
+
+Gere uma resposta curta e objetiva em português.
+"""
+        resposta = call_llm(prompt, max_new_tokens=60)
+        return resposta, operacao_sistema
+
+    else:
+        # class 2 => operação no sistema
         text_lower = user_text.lower()
-        
+
+        # Exemplo: procurar por 'usuário X'
         match_user = re.search(r"usuário\s+(\w+)", text_lower)
         if match_user:
             username = match_user.group(1)
-            user_data = consultar_usuario(username)
-            if user_data:
-                resposta = f"Dados de {username}: {user_data}"
+            data = consultar_usuario(username)
+            if data:
+                resposta = f"Dados de {username}: {data}"
             else:
                 resposta = f"Usuário {username} não encontrado."
-        
+
+        # Exemplo: procurar por 'alterar/mudar disciplina X Y'
         match_disc = re.search(r"(mudar|alterar)\s+disciplina\s+(\w+)\s+(\w+)", text_lower)
         if match_disc:
-            old_or_user = match_disc.group(2)
-            new_disc = match_disc.group(3)
-            ok = alterar_disciplina(old_or_user, new_disc)
+            user_alvo = match_disc.group(2).lower()
+            nova_disc = match_disc.group(3)
+            ok = alterar_disciplina(user_alvo, nova_disc)
             if ok:
-                resposta = f"Disciplina de {old_or_user} alterada para {new_disc}."
+                resposta = f"Disciplina de {user_alvo} alterada para {nova_disc}."
             else:
-                resposta = f"Não consegui alterar disciplina de {old_or_user}."
-            operacao_sistema = ("alterar_disciplina", old_or_user, new_disc)
-        
-        # Se não casou nenhum regex e não geramos resposta
-        if resposta == "":
+                resposta = f"Não consegui alterar disciplina de {user_alvo}."
+            operacao_sistema = ("alterar_disciplina", user_alvo, nova_disc)
+
+        if not resposta:
             resposta = "Parece ser algo relacionado ao sistema, mas não entendi a solicitação."
-    
-    return resposta, operacao_sistema
+
+        return resposta, operacao_sistema
 ```
 
-- **Fluxo**:  
-  1. Se for classificação 0 → retorna algo simples.  
-  2. Se for 1 → chama `retrieve_faq_responses` para buscar no FAQ.  
-  3. Se for 2 → faz lógica para identificar e executar operações via API:
-     - Consultar dados de usuário.  
-     - Alterar disciplina.  
+- **(1)**: Recupera trechos do FAQ (RAG) e gera uma resposta final com LLM.  
+- **(2)**: Identifica, via regex, se é “consultar usuário” ou “alterar disciplina”. Define `operacao_sistema` para o Verifier.
 
-- Armazena `operacao_sistema` se houve alguma chamada efetiva, para que o Verifier possa analisar.
-
----
-
-### Passo 6: Verificador (Verifier)
+### Passo 7: Verificador (Verifier)
 
 ```python
-def verifier(resposta, operacao_sistema, user_text):
+def verifier(user_text, resposta, operacao_sistema):
+    """
+    Se (operacao_sistema) for "alterar_disciplina", confere se o solicitante
+    é admin ou o próprio usuário. Se não, bloqueia.
+    """
     if not operacao_sistema:
         return True, None
-    
+
     if operacao_sistema[0] == "alterar_disciplina":
         user_alvo = operacao_sistema[1]
-        
-        # Exemplo: extrair quem está fazendo o pedido
         match_solicitante = re.search(r"eu sou\s+(\w+)", user_text.lower())
         if match_solicitante:
-            solicitante = match_solicitante.group(1)
-            if not is_admin(solicitante) and solicitante != user_alvo.lower():
-                return False, "Usuário não tem privilégios para alterar disciplina de outra pessoa."
-    
+            solicitante = match_solicitante.group(1).lower()
+            # Se solicitante não for admin e não for o próprio alvo => nega
+            if not is_admin(solicitante) and solicitante != user_alvo:
+                return False, "Você não tem privilégios para alterar a disciplina de outra pessoa."
     return True, None
 ```
 
-- Se não houve operação (ou seja, `operacao_sistema` é `None`), consideramos “válido” por padrão.  
-- Se for “alterar_disciplina”, checa se:
-  - O solicitante é **admin** ou está alterando a própria disciplina.  
-  - Caso contrário, retorna `(False, <motivo>)`, isto é, operação inválida.  
+- Se não há operação (por ex., categoria 0 ou 1), consideramos **válido** por padrão.  
+- Caso haja `("alterar_disciplina", ...)`, validamos se o solicitante (extraído de “Eu sou X”) é **admin** ou **o próprio usuário alvo**.
 
-Em sistemas reais, o Verifier poderia ser muito mais complexo, verificando permissões, logs, limites de uso etc.
-
----
-
-### Passo 7: Função “chatbot_pipeline” (União de Tudo)
+### Passo 8: Pipeline Final
 
 ```python
 def chatbot_pipeline(user_text):
-    # 1) Classifier
-    c = classify_user_text(user_text)
-    
+    # 1) Classificar
+    c = classify_user_text_llm(user_text)
+
     # 2) Executor
     resposta, operacao = executor(user_text, c)
-    
-    # 3) Verifier
-    valido, motivo = verifier(resposta, operacao, user_text)
-    
+
+    # 3) Verificador
+    valido, motivo = verifier(user_text, resposta, operacao)
     if valido:
         return f"[Resposta VÁLIDA]\n{resposta}"
     else:
         return f"[Resposta INVÁLIDA]\nMotivo: {motivo}\nPor favor, reformule ou tente outra ação."
 ```
 
-- Chamamos cada etapa em sequência:
-  1. Classificador determina a categoria.  
-  2. Executor gera resposta ou opera o sistema.  
-  3. Verificador valida a saída final.  
-- Se for válida, retorna resposta ao usuário; se inválida, retorna o motivo.
+- Integra as três etapas de forma sequencial.  
 
----
-
-## Testes Práticos
-
-Chamamos a função `chatbot_pipeline()` com exemplos de entrada:
+### Passo 9: Testes
 
 ```python
 print(chatbot_pipeline("Oi, tudo bem?"))
 print(chatbot_pipeline("Quanto custa a prova do CPHOS?"))
 print(chatbot_pipeline("Me mostre dados do usuário Joao"))
 print(chatbot_pipeline("Quero alterar disciplina Joao Fisica"))
-print(chatbot_pipeline("Eu sou Maria. Gostaria de alterar disciplina Joao Matematica"))
+print(chatbot_pipeline("Eu sou Maria. Desejo alterar disciplina Joao Matematica"))
 print(chatbot_pipeline("Eu sou Joao. Desejo alterar disciplina Maria Fisica"))
 ```
 
-**Possível saída**:  
-```
-[Resposta VÁLIDA]
-Olá! Como posso ajudar?
-[Resposta VÁLIDA]
-Baseado no guia, encontrei: A prova do CPHOS custa R$ 0, pois é oferecida gratuitamente.
-[Resposta VÁLIDA]
-Dados de joao: {'id': 2, 'nome': 'João', 'disciplina': 'Matemática', 'adm': False}
-[Resposta VÁLIDA]
-Disciplina de joao alterada para fisica.
-[Resposta VÁLIDA]
-Disciplina de joao alterada para matematica.
-[Resposta INVÁLIDA]
-Motivo: Usuário não tem privilégios para alterar disciplina de outra pessoa.
-Por favor, reformule ou tente outra ação.
-```
-
-Isso confirma que o fluxo funciona:
-1. Perguntas triviais → Resposta básica.  
-2. Perguntas sobre FAQ → Busca no corpus de FAQ.  
-3. Operações no sistema → Chamada de API + verificação de permissões.  
+- Testa cada cenário de pergunta:
+  1. Saudação trivial.  
+  2. Pergunta sobre o FAQ (“quanto custa”).  
+  3. Consulta de usuário.  
+  4. Alterar disciplina sem se identificar (não bloqueia se o Verifier não encontrar falha).  
+  5. Alterar disciplina com “Eu sou Maria” (admin).  
+  6. Alterar disciplina com “Eu sou Joao” (não-admin, afetando outra pessoa).
 
 ---
 
-## Pontos de Atenção e Possíveis Melhorias
+## Funcionamento Resumido
 
-1. **Heurísticas de Classificação**  
-   - Atualmente, o *Classifier* usa expressões regulares e palavras-chave. Pode ser substituído por um modelo de classificação de textos usando LLM ou *fine-tuning*.  
+1. **Pergunta trivial** (“Oi, tudo bem?”) é classificada como 0 → *Executor* retorna saudação. *Verifier* não encontra operação → aceita como “VÁLIDO”.  
+2. **Pergunta de FAQ** (“Quanto custa a prova do CPHOS?”) é classificada como 1 → RAG no FAQ, chama LLM para sintetizar. *Verifier* não vê operação → “VÁLIDO”.  
+3. **Consulta de usuário** (“Me mostre dados do usuário Joao”) classifica como 2 (depende de regex). *Executor* chama `consultar_usuario("joao")`, retorna dados. *Verifier* não vê *alterar_disciplina* → “VÁLIDO”.  
+4. **Alterar disciplina** (“Quero alterar disciplina Joao Fisica”) → *Executor* chama `alterar_disciplina("joao", "Fisica")`. *Verifier* não encontra “Eu sou X” → sem bloqueio → “VÁLIDO”.  
+5. **Alterar disciplina** (“Eu sou Maria. Desejo alterar disciplina Joao Matematica”) → *Verifier* encontra `operacao_sistema=("alterar_disciplina", "joao", "Matematica")` e “Eu sou Maria”. Maria é admin → “VÁLIDO”.  
+6. **Alterar disciplina** (“Eu sou Joao. Desejo alterar disciplina Maria Fisica”) → *Verifier* vê que João não é admin e difere do user alvo (“maria”) → “INVÁLIDO”.
 
-2. **Regex para parsing de comandos**  
-   - No *Executor*, identificar a intenção de “consultar usuário” ou “alterar disciplina” é feito via regex. Em produção, poderia haver um parser mais robusto ou uso de *prompt engineering*.  
+---
 
-3. **Persistência de Dados**  
-   - Aqui, `USER_DB` é um simples dicionário. Em um sistema real, haveria persistência (banco relacional, NoSQL, etc.) e encapsulamento de transações.  
+## Possíveis Melhorias
 
-4. **Segurança e Permissões**  
-   - O Verifier exemplifica como se poderia checar privilégios. Em produção, esse check poderia ser expandido para logs, limites de operação, auditoria etc.  
+1. **Prompt Engineering** no LLM  
+   - Ajustar prompts para evitar que o modelo repita partes do texto ou insira “Você é um assistente em português…” na resposta final.  
+   - Adicionar exemplos *few-shot* para o classificador.  
 
-5. **LLMs Reais e Prompt Tuning**  
-   - Para integrar GPT-4 ou GPT-3.5, seria preciso usar *prompts* customizados e organizar respostas em formato de JSON (para não cometer erros ao chamar APIs).  
+2. **Controle de Sessão**  
+   - Caso haja diálogos múltiplos (ex.: “Quero alterar disciplina para Fisica.” e depois “Aliás, para Química.”), seria preciso manter contexto do usuário (ID, sessão etc.).  
 
-6. **Manter Contexto (Conversational)**  
-   - Caso haja múltiplas trocas de mensagem, poderia-se gerenciar sessões, estados de conversas e “lembrar” perguntas anteriores do usuário.  
+3. **Validação de Permissões Mais Rigorosa**  
+   - O Verifier poderia chamar novamente o LLM para analisar a lógica de permissão, ou usar regras fixas adicionais.  
+
+4. **UI/Front-End**  
+   - Poderíamos expor esse chatbot via um endpoint REST (por ex. usando Flask ou FastAPI) e integrar com Slack, WhatsApp, etc.
+
+5. **Otimização de Desempenho**  
+   - Carregar FLAN-T5-base pode ser pesado. Caso o ambiente Colab seja fraco, considerar modelos menores ou *distil*.
 
 ---
 
 ## Conclusão
 
-Este código **demonstra** a arquitetura **Classifier → Executor → Verifier** em um ambiente simplificado. Ele ilustra como combinar:
+Este código exemplifica uma **arquitetura básica** de chatbot usando um **LLM gratuito** (Flan-T5-base) para:
 
-- **Busca vetorial (FAISS)** para responder perguntas com base em textos de FAQ,  
-- **Chamadas de API** (funções Python que representam o sistema de back-end),  
-- **Camada de verificação** para evitar ações incorretas ou sem permissão.  
+- **Entender** a intenção do usuário (Classifier).  
+- **Buscar informações** em um FAQ via *retrieval* (Executor).  
+- **Executar operações** de forma controlada em um “banco de dados” simulado.  
+- **Verificar permissões** (Verifier) antes de qualquer ação sensível.
 
-O modelo resultante serve como **prova de conceito** de um chatbot híbrido que responde tanto perguntas baseadas em documentos quanto realiza operações seguras no sistema, aproximando-se de cenários reais de atendimento ao cliente.
+Ele **não** é um sistema de produção pronto, mas **demonstra** como combinar:
+
+- **Busca semântica** (FAISS + Sentence Transformers).  
+- **Inferência de LLM local** (Flan-T5).  
+- **Arquitetura CHOPS** (Classifier → Executor → Verifier).  
+
+Para refinar, basta melhorar os prompts do LLM, adicionar mais regras de verificação e tratar sessões de conversa de maneira mais robusta.
